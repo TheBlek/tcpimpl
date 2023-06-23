@@ -1,52 +1,7 @@
 use std::io::Read;
-use anyhow::{
-    Context,
-    Result,
-};
-use etherparse::{
-    Ipv4Header,
-    TcpHeader,
-};
+use packet::*;
 
-#[derive(Debug)]
-struct IPPacket<'a> {
-    header: Ipv4Header,
-    body: &'a [u8],
-}
-
-impl<'a> IPPacket<'a> {
-    fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
-        let (header, body) = Ipv4Header::from_slice(bytes)?;
-        Ok(
-            Self {
-                body,
-                header,
-            }
-        )
-    }
-
-    fn protocol(&self) -> u8 {
-        self.header.protocol
-    }
-}
-
-#[derive(Debug)]
-struct TCPPacket<'a> {
-    header: TcpHeader,
-    body: &'a [u8],
-}
-
-impl<'a> TCPPacket<'a> {
-    fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
-        let (header, body) = TcpHeader::from_slice(bytes)?;
-        Ok(
-            Self {
-                body,
-                header,
-            }
-        )
-    }
-}
+mod packet;
 
 fn print_skip(message: &str) {
     println!("{}", message);
