@@ -12,7 +12,7 @@ use std::io::{
 
 mod packet;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct SendConnectionState {
     unacknowleged: u32,
     next: u32,
@@ -21,14 +21,14 @@ struct SendConnectionState {
     isn: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct RecieveConnectionState {
     next: u32,
     window: u16,
     isn: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct ConnectionState {
     send: SendConnectionState,
     receive: RecieveConnectionState,
@@ -58,25 +58,26 @@ impl TcpState {
                 match (in_header.syn, in_header.ack) {
                     (true, false) => {
                         let isn = 0; // TODO: use MD5 on some state. RFC 1948.
-                        let new_state = ConnectionState {
-                            send: SendConnectionState {
-                                unacknowleged: isn,
-                                window: in_header.window_size,
-                                isn,
-                                urgent_pointer: false,
-                                next: isn + TcpState::RECIEVE_WINDOW_SIZE as u32,
-                            },
-                            receive: RecieveConnectionState {
-                                next: in_header.sequence_number + 1,
-                                window: TcpState::RECIEVE_WINDOW_SIZE,
-                                isn: in_header.sequence_number
+                        *self = TcpState::BeingConnectedTo(
+                            ConnectionState {
+                                send: SendConnectionState {
+                                    unacknowleged: isn,
+                                    window: in_header.window_size,
+                                    isn,
+                                    urgent_pointer: false,
+                                    next: isn + TcpState::RECIEVE_WINDOW_SIZE as u32,
+                                },
+                                receive: RecieveConnectionState {
+                                    next: in_header.sequence_number + 1,
+                                    window: TcpState::RECIEVE_WINDOW_SIZE,
+                                    isn: in_header.sequence_number
+                                }
                             }
-                        };
+                        );
                         header.syn = true;
                         header.ack = true;
-                        header.sequence_number = new_state.send.unacknowleged;
-                        header.acknowledgment_number = new_state.receive.next;
-                        *self = TcpState::BeingConnectedTo(new_state);
+                        header.sequence_number = isn;
+                        header.acknowledgment_number = in_header.sequence_number + 1;
                         Some(TcpPacket::from_header(header))
                     }
                     (_, _) => {
@@ -98,7 +99,7 @@ impl TcpState {
                             in_header.source_port,
                             in_header.destination_port,
                         );
-                        *self = TcpState::Established(*state);
+                        *self = TcpState::Established(*seq, ack);
                         None
                     },
                     (_, _, _) => {
@@ -113,7 +114,7 @@ impl TcpState {
                     }
                 }
             },
-            TcpState::Established(_) => todo!(),
+            TcpState::Established(_, _) => todo!(),
         }
     }
 }
