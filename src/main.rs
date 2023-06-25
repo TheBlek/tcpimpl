@@ -45,6 +45,20 @@ impl TcpState {
             0,
             in_header.window_size,
         );
+
+        macro_rules! reset_packet {
+            ($sequence_number:expr) => {{
+                println!(
+                    "Invalid packet from {}. Resetting connection",
+                    in_header.source_port
+                );
+                println!("{:?}", in_header);
+                header.rst = true;
+                header.sequence_number = $sequence_number;
+                TcpPacket::from_header(header)
+            }};
+        }
+
         match self {
             TcpState::Listening => match (in_header.syn, in_header.ack) {
                 (true, false) => {
@@ -68,19 +82,17 @@ impl TcpState {
                     header.sequence_number = new_state.send.unacknowleged;
                     header.acknowledgment_number = new_state.receive.next;
                     *self = TcpState::BeingConnectedTo(new_state);
-                    Some(TcpPacket::from_header(header))
+                    return Some(TcpPacket::from_header(header));
                 }
+                (_, true) => {
+                    *self = TcpState::Listening;
+                    Some(reset_packet!(in_header.acknowledgment_number))
+                },
                 _ => {
-                    println!(
-                        "Invalid package from {}. Resetting connection",
-                        in_header.source_port
-                    );
-                    header.rst = true;
-                    Some(TcpPacket::from_header(header))
+                    *self = TcpState::Listening;
+                    Some(reset_packet!(0))
                 }
             },
-
-            TcpState::Connecting(_) => todo!(),
             TcpState::BeingConnectedTo(state) => match (
                 in_header.rst,
                 in_header.syn,
@@ -89,8 +101,9 @@ impl TcpState {
             ) {
                 (true, ..) => {
                     println!("Connection is asked to be reset.");
+                    *self = TcpState::Listening;
                     None
-                },
+                }
                 (_, false, true, ack) if ack == state.send.unacknowleged + 1 => {
                     println!(
                         "Established connection {} <-> {}",
@@ -101,19 +114,32 @@ impl TcpState {
                     // I wonder if compiler can optimize it out
                     *self = TcpState::Established(*state);
                     None
-                }
-                _ => {
-                    println!(
-                        "Invalid packet from {}. Resetting connection",
-                        in_header.source_port
-                    );
-                    println!("{:?}", in_header);
-                    header.rst = true;
+                },
+                (_, _, true, _) => {
                     *self = TcpState::Listening;
-                    Some(TcpPacket::from_header(header))
+                    Some(reset_packet!(in_header.acknowledgment_number))
+                },
+                _ => {
+                    *self = TcpState::Listening;
+                    Some(reset_packet!(0))
                 }
             },
-            TcpState::Established(_) => todo!(),
+            TcpState::Established(state) => match (
+                in_header.rst,
+                in_header.syn,
+                in_header.ack,
+                in_header.acknowledgment_number,
+            ) {
+                (true, ..) => {
+                    println!("Connection is asked to be reset.");
+                    *self = TcpState::Listening;
+                    None
+                }
+                _ => {
+                    None
+                }
+            },
+            TcpState::Connecting(_) => todo!(),
         }
     }
 }
