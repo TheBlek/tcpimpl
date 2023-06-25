@@ -1,14 +1,6 @@
-use etherparse::{
-    Ipv4Header,
-    TcpHeader,
-    IpNumber,
-};
+use etherparse::{IpNumber, Ipv4Header, TcpHeader};
 use packet::*;
-use std::io::{
-    Read,
-    Write,
-    BufWriter,
-};
+use std::io::{BufWriter, Read, Write};
 
 mod packet;
 
@@ -54,63 +46,71 @@ impl TcpState {
             in_header.window_size,
         );
         match self {
-            TcpState::Listening => {
-                match (in_header.syn, in_header.ack) {
-                    (true, false) => {
-                        let isn = 0; // TODO: use MD5 on some state. RFC 1948.
-                        let new_state = ConnectionState {
-                            send: SendConnectionState {
-                                unacknowleged: isn,
-                                window: in_header.window_size,
-                                isn,
-                                urgent_pointer: false,
-                                next: isn + TcpState::RECIEVE_WINDOW_SIZE as u32,
-                            },
-                            receive: RecieveConnectionState {
-                                next: in_header.sequence_number + 1,
-                                window: TcpState::RECIEVE_WINDOW_SIZE,
-                                isn: in_header.sequence_number
-                            }
-                        };
-                        header.syn = true;
-                        header.ack = true;
-                        header.sequence_number = new_state.send.unacknowleged;
-                        header.acknowledgment_number = new_state.receive.next;
-                        *self = TcpState::BeingConnectedTo(new_state);
-                        Some(TcpPacket::from_header(header))
-                    }
-                    (_, _) => {
-                        println!(
-                            "Invalid package from {}. Resetting connection",
-                            in_header.source_port
-                        );
-                        header.rst = true;
-                        Some(TcpPacket::from_header(header))
-                    } 
-                } 
-            } 
+            TcpState::Listening => match (in_header.syn, in_header.ack) {
+                (true, false) => {
+                    let isn = 0; // TODO: use MD5 on some state. RFC 1948.
+                    let new_state = ConnectionState {
+                        send: SendConnectionState {
+                            unacknowleged: isn,
+                            window: in_header.window_size,
+                            isn,
+                            urgent_pointer: false,
+                            next: isn + TcpState::RECIEVE_WINDOW_SIZE as u32,
+                        },
+                        receive: RecieveConnectionState {
+                            next: in_header.sequence_number + 1,
+                            window: TcpState::RECIEVE_WINDOW_SIZE,
+                            isn: in_header.sequence_number,
+                        },
+                    };
+                    header.syn = true;
+                    header.ack = true;
+                    header.sequence_number = new_state.send.unacknowleged;
+                    header.acknowledgment_number = new_state.receive.next;
+                    *self = TcpState::BeingConnectedTo(new_state);
+                    Some(TcpPacket::from_header(header))
+                }
+                _ => {
+                    println!(
+                        "Invalid package from {}. Resetting connection",
+                        in_header.source_port
+                    );
+                    header.rst = true;
+                    Some(TcpPacket::from_header(header))
+                }
+            },
+
             TcpState::Connecting(_) => todo!(),
-            TcpState::BeingConnectedTo(state) => {
-                match (in_header.syn, in_header.ack, in_header.acknowledgment_number) {
-                    (false, true, ack) if ack == state.send.unacknowleged + 1 => {
-                        println!(
-                            "Established connection {} <-> {}",
-                            in_header.source_port,
-                            in_header.destination_port,
-                        );
-                        *self = TcpState::Established(*state);
-                        None
-                    },
-                    (_, _, _) => {
-                        println!(
-                            "Invalid packet from {}. Resetting connection",
-                            in_header.source_port
-                        );
-                        println!("{:?}", in_header);
-                        header.rst = true;
-                        *self = TcpState::Listening;
-                        Some(TcpPacket::from_header(header))
-                    }
+            TcpState::BeingConnectedTo(state) => match (
+                in_header.rst,
+                in_header.syn,
+                in_header.ack,
+                in_header.acknowledgment_number,
+            ) {
+                (true, ..) => {
+                    println!("Connection is asked to be reset.");
+                    None
+                },
+                (_, false, true, ack) if ack == state.send.unacknowleged + 1 => {
+                    println!(
+                        "Established connection {} <-> {}",
+                        in_header.source_port, in_header.destination_port,
+                    );
+                    // This requires Copy on state
+                    // Most likely it copies data
+                    // I wonder if compiler can optimize it out
+                    *self = TcpState::Established(*state);
+                    None
+                }
+                _ => {
+                    println!(
+                        "Invalid packet from {}. Resetting connection",
+                        in_header.source_port
+                    );
+                    println!("{:?}", in_header);
+                    header.rst = true;
+                    *self = TcpState::Listening;
+                    Some(TcpPacket::from_header(header))
                 }
             },
             TcpState::Established(_) => todo!(),
@@ -168,6 +168,10 @@ fn main() {
                 continue;
             }
         };
+        if !tcp_packet.is_checksum_valid(ip_packet.header.source, ip_packet.header.destination) {
+            // print_skip("Packet checksum is incorrect.");
+            continue;
+        }
 
         println!(
             "Registered packet from {:?}:{:?} to {:?}:{:?}. {:?}",
@@ -201,11 +205,21 @@ fn main() {
 
         println!("Responding");
 
-        device_buffered.write_all(&buf[..=3]).expect("Could not write eth bytes");
-        ip_response.write(&mut device_buffered).expect("Failed to write ip header");
-        tcp_response.header.write(&mut device_buffered).expect("Failed to write tcp header");
+        device_buffered
+            .write_all(&buf[..=3])
+            .expect("Could not write eth bytes");
+        ip_response
+            .write(&mut device_buffered)
+            .expect("Failed to write ip header");
+        tcp_response
+            .header
+            .write(&mut device_buffered)
+            .expect("Failed to write tcp header");
+
         if !tcp_response.body.is_empty() {
-            device_buffered.write_all(tcp_response.body).expect("Failed to write tcp body");
+            device_buffered
+                .write_all(tcp_response.body)
+                .expect("Failed to write tcp body");
         }
         device_buffered.flush().unwrap();
     }

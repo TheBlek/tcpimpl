@@ -36,4 +36,12 @@ impl<'a> TcpPacket<'a> {
     pub fn from_header(header: TcpHeader) -> Self {
         Self { header, body: &[] }
     }
+
+    pub fn is_checksum_valid(&self, source: [u8; 4], destination: [u8; 4]) -> bool {
+        let intended = self
+            .header
+            .calc_checksum_ipv4_raw(source, destination, self.body)
+            .unwrap();
+        intended == self.header.checksum
+    }
 }
