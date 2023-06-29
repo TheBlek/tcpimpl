@@ -27,6 +27,14 @@ pub struct TcpPacket<'a> {
     pub body: &'a [u8],
 }
 
+pub enum PacketResponse {
+    Reset(u32),
+    Syn(u32),
+    SynAck(u32, u32),
+    Ack(u32, u32),
+    Fin(u32, u32),
+}
+
 impl<'a> TcpPacket<'a> {
     pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
         let (header, body) = TcpHeader::from_slice(bytes)?;
@@ -43,5 +51,42 @@ impl<'a> TcpPacket<'a> {
             .calc_checksum_ipv4_raw(source, destination, self.body)
             .unwrap();
         intended == self.header.checksum
+    }
+
+    pub fn respond(self, window: u16, response: PacketResponse) -> TcpPacket<'a> {
+        let mut header = TcpHeader::new(
+            self.header.destination_port,
+            self.header.source_port,
+            0,
+            window,
+        );
+        match response {
+            PacketResponse::Reset(seq) => {
+                header.rst = true;
+                header.sequence_number = seq;
+            }
+            PacketResponse::Syn(seq) => {
+                header.syn = true;
+                header.sequence_number = seq;
+            }
+            PacketResponse::SynAck(seq, ack) => {
+                header.syn = true;
+                header.ack = true;
+                header.sequence_number = seq;
+                header.acknowledgment_number = ack;
+            }
+            PacketResponse::Ack(seq, ack) => {
+                header.ack = true;
+                header.sequence_number = seq;
+                header.acknowledgment_number = ack;
+            }
+            PacketResponse::Fin(seq, ack) => {
+                header.ack = true;
+                header.acknowledgment_number = ack;
+                header.sequence_number = seq;
+                header.fin = true;
+            }
+        }
+        TcpPacket::from_header(header)
     }
 }
