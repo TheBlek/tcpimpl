@@ -56,7 +56,6 @@ struct TcpStream {
     state: SyncTcpState,
     manager: ConnectionManager,
     received: VecDeque<u8>,
-    to_send: VecDeque<u8>,
     local: ([u8; 4], u16), // TODO: Type for an address
     remote: ([u8; 4], u16),
 }
@@ -64,42 +63,26 @@ struct TcpStream {
 impl TcpStream {
     fn close(&mut self) {
         if self.state == SyncTcpState::Closed {
+            println!("Connection is closed!");
             return;
         }
-        match self.state {
-            SyncTcpState::Established | SyncTcpState::CloseWait => {
-                let mut header = TcpHeader::new(
-                    self.local.1,
-                    self.remote.1,
-                    self.connection.send.unacknowleged,
-                    0,
-                );
+        let mut header = TcpHeader::new(
+            self.local.1,
+            self.remote.1,
+            self.connection.send.unacknowleged,
+            0,
+        );
 
-                header.ack = true;
-                header.fin = true;
-                header.acknowledgment_number = self.connection.receive.next;
-                self.manager.inner.borrow_mut().send_packet(
-                    TcpPacket::from_header(header),
-                    self.local.0,
-                    self.remote.0,
-                    0,
-                );
-                self.state = if self.state == SyncTcpState::Established {
-                    SyncTcpState::FinWait1
-                } else {
-                    SyncTcpState::LastAck
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn terminate(&mut self) {
-        self.close();
-
-        while self.state != SyncTcpState::Closed {
-            self.update();
-        }
+        header.ack = true;
+        header.fin = true;
+        header.acknowledgment_number = self.connection.receive.next;
+        self.manager.inner.borrow_mut().send_packet(
+            TcpPacket::from_header(header),
+            self.local.0,
+            self.remote.0,
+            0,
+        );
+        self.state = SyncTcpState::FinWait1;
     }
 
     fn update(&mut self) {
@@ -139,7 +122,6 @@ impl TcpStream {
                     return TcpAnswer::Packet(packet.respond(
                         receive.window,
                         PacketResponse::Ack(send.unacknowleged, receive.next),
-                        &[]
                     ));
                 }
                 match self.state {
@@ -155,7 +137,6 @@ impl TcpStream {
                                 packet.respond(
                                     receive.window,
                                     PacketResponse::Fin(send.unacknowleged, ack),
-                                    &[],
                                 ),
                                 (),
                             );
@@ -164,22 +145,13 @@ impl TcpStream {
                         let data_start = receive.next.wrapping_sub(packet.header.sequence_number);
                         let received_data = &packet.body[data_start as usize..];
                         self.received.extend(received_data.iter());
+
                         receive.next += received_data.len() as u32;
-
-
-                        let acknowledged = packet.header.acknowledgment_number.wrapping_sub(send.unacknowleged);
-                        self.to_send.drain(..acknowledged as usize);
-                        send.unacknowleged = packet.header.acknowledgment_number;
-                        send.window = packet.header.window_size;
-
-                        let (data, _): (&[u8], &[u8]) = self.to_send.as_slices();
-                        let amt = std::cmp::min(data.len(), send.window as usize);
 
                         TcpAnswer::PacketReturn(
                             packet.respond(
                                 ConnectionManager::RECIEVE_WINDOW_SIZE,
                                 PacketResponse::Ack(send.unacknowleged, receive.next),
-                                &data[..amt] 
                             ),
                             (),
                         )
@@ -204,7 +176,6 @@ impl TcpStream {
                             TcpAnswer::Packet(packet.respond(
                                 0, // We cant receive anything
                                 PacketResponse::Ack(send.unacknowleged, receive.next),
-                                &[]
                             ))
                         }
                     }
@@ -215,9 +186,8 @@ impl TcpStream {
                             self.state = SyncTcpState::Closing;
                             return TcpAnswer::PacketReturn(
                                 packet.respond(
-                                    receive.window,
+                                    ConnectionManager::RECIEVE_WINDOW_SIZE,
                                     PacketResponse::Fin(send.unacknowleged, receive.next),
-                                    &[]
                                 ),
                                 (),
                             );
@@ -232,9 +202,8 @@ impl TcpStream {
                         } else {
                             TcpAnswer::PacketReturn(
                                 packet.respond(
-                                    receive.window,
+                                    ConnectionManager::RECIEVE_WINDOW_SIZE,
                                     PacketResponse::Fin(send.unacknowleged, receive.next),
-                                    &[]
                                 ),
                                 (),
                             )
@@ -247,9 +216,8 @@ impl TcpStream {
                             self.state = SyncTcpState::Closed;
                             return TcpAnswer::PacketReturn(
                                 packet.respond(
-                                    receive.window,
+                                    ConnectionManager::RECIEVE_WINDOW_SIZE,
                                     PacketResponse::Fin(send.unacknowleged, receive.next),
-                                    &[]
                                 ),
                                 (),
                             );
@@ -263,9 +231,8 @@ impl TcpStream {
 
                         TcpAnswer::PacketReturn(
                             packet.respond(
-                                receive.window,
+                                ConnectionManager::RECIEVE_WINDOW_SIZE,
                                 PacketResponse::Ack(send.unacknowleged, receive.next),
-                                &[]
                             ),
                             (),
                         )
@@ -281,7 +248,6 @@ impl TcpStream {
                                 packet.respond(
                                     ConnectionManager::RECIEVE_WINDOW_SIZE,
                                     PacketResponse::Fin(send.unacknowleged, receive.next),
-                                    &[]
                                 ),
                                 (),
                             )
@@ -313,20 +279,15 @@ impl Read for TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        self.terminate();
+        while self.state != SyncTcpState::Closed {
+            self.update();
+        }
     }
 }
 
-impl Write for TcpStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let amt = std::cmp::min(buf.len(), self.connection.send.window as usize);
-        Ok(amt)
-    }
+// impl Write for TcpStream {
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        todo!()
-    }
-}
+// }
 
 enum UnsyncTcpState {
     Listen,
@@ -396,9 +357,9 @@ impl InnerConnectionManager {
     // TODO: make an iterator over the packets. (But what about writing?)
     // This way I do not need to make this abomination
     //
-    fn proccess_packets<'a, F, T>(&'a mut self, (address, port): ([u8; 4], u16), mut f: F) -> T
+    fn proccess_packets<F, T>(&mut self, (address, port): ([u8; 4], u16), mut f: F) -> T
     where
-        F: FnMut(TcpPacket) -> TcpAnswer<'a, T>,
+        F: FnMut(TcpPacket) -> TcpAnswer<T>,
     {
         let mut buf = [0; 1504];
         loop {
@@ -507,7 +468,6 @@ impl ConnectionManager {
                                     new_state.send.unacknowleged,
                                     new_state.receive.next,
                                 ),
-                                &[],
                             ))
                         }
                         (_, ack) => {
@@ -518,7 +478,7 @@ impl ConnectionManager {
                             };
                             TcpAnswer::Packet(
                                 packet
-                                    .respond(Self::RECIEVE_WINDOW_SIZE, PacketResponse::Reset(seq), &[]),
+                                    .respond(Self::RECIEVE_WINDOW_SIZE, PacketResponse::Reset(seq)),
                             )
                         }
                     },
@@ -545,7 +505,7 @@ impl ConnectionManager {
                             };
                             TcpAnswer::Packet(
                                 packet
-                                    .respond(connection_state.send.window, PacketResponse::Reset(seq), &[]),
+                                    .respond(Self::RECIEVE_WINDOW_SIZE, PacketResponse::Reset(seq)),
                             )
                         }
                     },
@@ -560,7 +520,6 @@ impl ConnectionManager {
                 inner: Rc::clone(&self.inner),
             },
             received: VecDeque::new(),
-            to_send: VecDeque::new(),
             state: SyncTcpState::Established,
         }
     }

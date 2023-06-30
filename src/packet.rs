@@ -53,7 +53,7 @@ impl<'a> TcpPacket<'a> {
         intended == self.header.checksum
     }
 
-    pub fn respond(self, window: u16, response: PacketResponse) -> TcpPacket<'a> {
+    pub fn respond<'b>(self, window: u16, response: PacketResponse, body: &'b [u8]) -> TcpPacket<'b> {
         let mut header = TcpHeader::new(
             self.header.destination_port,
             self.header.source_port,
@@ -87,6 +87,6 @@ impl<'a> TcpPacket<'a> {
                 header.fin = true;
             }
         }
-        TcpPacket::from_header(header)
+        TcpPacket { header, body }
     }
 }
