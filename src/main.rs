@@ -1,27 +1,42 @@
 use anyhow::Result;
 use etherparse::{IpNumber, Ipv4Header, TcpHeader};
-use generational_arena::Arena;
 use packet::*;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::io::{BufWriter, Read, Write};
 use std::rc::Rc;
-use tcp::{is_between_wrapping, ConnectionState, ReceiveConnectionState, SendConnectionState};
+use tcp::{ConnectionState, ReceiveConnectionState, SendConnectionState};
 
 mod packet;
 mod tcp;
 
-fn parse_address(addr: &str) -> Result<([u8; 4], u16)> {
-    let mut iter = addr.split(':');
-    let address = iter
-        .next()
-        .unwrap()
-        .split('.')
-        .map(|s| s.parse::<u8>().unwrap())
-        .collect::<Vec<_>>()[..4]
-        .try_into()?;
-    let port = iter.next().unwrap().parse().unwrap();
-    Ok((address, port))
+struct Addr {
+    ip: [u8; 4],
+    port: u16,
+}
+
+impl From<([u8; 4], u16)> for Addr {
+    fn from((ip, port): ([u8; 4], u16)) -> Self {
+        Self { ip, port }
+    }
+}
+
+impl TryFrom<&str> for Addr {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        let mut iter = value.split(':');
+        let address = iter
+            .next()
+            .unwrap()
+            .split('.')
+            .map(|s| s.parse::<u8>().unwrap())
+            .collect::<Vec<_>>()[..4]
+            .try_into()?;
+        let port = iter.next().unwrap().parse().unwrap();
+        Ok(Addr { ip: address, port })
+    }
 }
 
 // struct TcpListener {
@@ -71,8 +86,8 @@ struct TcpStream {
     manager: ConnectionManager,
     received: VecDeque<u8>,
     to_send: VecDeque<u8>,
-    local: ([u8; 4], u16), // TODO: Type for an address
-    remote: ([u8; 4], u16),
+    local: Addr, // TODO: Type for an address
+    remote: Addr,
 }
 
 impl TcpStream {
@@ -83,8 +98,8 @@ impl TcpStream {
         match self.state {
             SyncTcpState::Established | SyncTcpState::CloseWait => {
                 let mut header = TcpHeader::new(
-                    self.local.1,
-                    self.remote.1,
+                    self.local.port,
+                    self.remote.port,
                     self.connection.send.unacknowleged,
                     0,
                 );
@@ -94,8 +109,8 @@ impl TcpStream {
                 header.acknowledgment_number = self.connection.receive.next;
                 self.manager.inner.borrow_mut().send_packet(
                     TcpPacket::from_header(header),
-                    self.local.0,
-                    self.remote.0,
+                    self.local.ip,
+                    self.remote.ip,
                     0,
                 );
                 self.state = if self.state == SyncTcpState::Established {
@@ -218,7 +233,7 @@ impl TcpStream {
         self.manager
             .inner
             .borrow_mut()
-            .send_packet(response, self.local.0, self.remote.0, 0);
+            .send_packet(response, self.local.ip, self.remote.ip, 0);
     }
 }
 
@@ -325,7 +340,7 @@ impl InnerConnectionManager {
     // is not possible using Iterator trait and would require GATs for lifetimes
     // I would rather not write a separate type for an iterator (bc it won't
     // get all the nice stuff beyond next).
-    fn next(&mut self, (address, port): ([u8; 4], u16)) -> ([u8; 4], TcpPacket) {
+    fn next(&mut self, local: Addr) -> ([u8; 4], TcpPacket) {
         let mut buf = [0; 1504];
         loop {
             let device = self.tun.get_mut();
@@ -342,7 +357,7 @@ impl InnerConnectionManager {
                 continue;
             };
 
-            if ip_packet.header.destination != address || ip_packet.protocol() != TCP_IP_TYPE {
+            if ip_packet.header.destination != local.ip || ip_packet.protocol() != TCP_IP_TYPE {
                 continue;
             }
 
@@ -355,7 +370,7 @@ impl InnerConnectionManager {
                 continue;
             }
 
-            if tcp_packet.header.destination_port != port {
+            if tcp_packet.header.destination_port != local.port {
                 continue;
             }
 
@@ -367,7 +382,7 @@ impl InnerConnectionManager {
 impl ConnectionManager {
     const RECIEVE_WINDOW_SIZE: u16 = 200;
 
-    fn new(addr: &str, netmask: &str) -> Result<ConnectionManager> {
+    fn new(addr: impl tun::IntoAddress, netmask: &str) -> Result<ConnectionManager> {
         let mut config = tun::Configuration::default();
         config
             .layer(tun::Layer::L3)
@@ -386,9 +401,13 @@ impl ConnectionManager {
     }
 
     // TODO: make a trait IntoAddr or smth
-    fn accept(&mut self, addr: &str) -> TcpStream {
+    fn accept<T>(&mut self, addr: T) -> TcpStream
+    where
+        T: TryInto<Addr>,
+        <T as TryInto<Addr>>::Error: Debug,
+    {
         let mut state = UnsyncTcpState::Listen;
-        let address = parse_address(addr).expect("Invalid address");
+        let address = addr.try_into().expect("invalid address");
         let mut manager = self.inner.borrow_mut();
         let (connection_state, remote) = loop {
             let (remote, packet) = manager.next(address);
@@ -464,12 +483,12 @@ impl ConnectionManager {
                 },
                 UnsyncTcpState::SynSent(_) => panic!(),
             } {
-                manager.send_packet(response, address.0, remote, 0)
+                manager.send_packet(response, address.ip, remote, 0)
             }
         };
         TcpStream {
             local: address,
-            remote,
+            remote: remote.into(),
             connection: connection_state,
             manager: ConnectionManager {
                 inner: Rc::clone(&self.inner),
