@@ -63,7 +63,6 @@ impl SyncTcpState {
                 | SyncTcpState::Closing
         )
     }
-
 }
 
 struct TcpStream {
@@ -118,19 +117,17 @@ impl TcpStream {
     }
 
     fn state_transition(&mut self, packet: &TcpPacket) {
-        // Packet assumed to be with correct sequence numbers
+        // Packet is assumed to be with correct sequence numbers
         let send = &mut self.connection.send;
         let receive = &mut self.connection.receive;
         match self.state {
             SyncTcpState::Established => {
-                if packet.header.fin {
+                if packet.header.fin && packet.header.sequence_number == receive.next {
                     // Other side is finished sending data
-                    receive.next += 1;
+                    receive.next = receive.next.wrapping_add(1);
                     self.state = SyncTcpState::CloseWait;
-                    return;
                 }
             }
-            SyncTcpState::CloseWait => return,
             SyncTcpState::LastAck => {
                 if packet.header.acknowledgment_number == send.unacknowleged + 1 {
                     self.state = SyncTcpState::Closed;
@@ -139,40 +136,38 @@ impl TcpStream {
             SyncTcpState::FinWait1 => {
                 if packet.header.fin && packet.header.sequence_number == receive.next {
                     // Other side is finished sending data too
-                    receive.next += 1;
+                    receive.next = receive.next.wrapping_add(1);
                     self.state = SyncTcpState::Closing;
                 }
 
-                if packet.header.ack
-                    && packet.header.acknowledgment_number == send.unacknowleged + 1
-                {
-                    send.unacknowleged += 1;
+                if packet.header.acknowledgment_number == send.unacknowleged + 1 {
+                    send.unacknowleged = send.unacknowleged.wrapping_add(1);
                     self.state = SyncTcpState::FinWait2;
                 }
             }
             SyncTcpState::FinWait2 => {
                 if packet.header.fin && packet.header.sequence_number == receive.next {
                     // Other side is finished sending data too
-                    receive.next += 1;
+                    receive.next = receive.next.wrapping_add(1);
                     // No time wait for now - timers not implemented yet
                     self.state = SyncTcpState::Closed;
                 }
             }
             SyncTcpState::Closing => {
-                if packet.header.acknowledgment_number == send.unacknowleged + 1
-                {
+                if packet.header.acknowledgment_number == send.unacknowleged + 1 {
                     self.state = SyncTcpState::Closed;
                 }
             }
-            SyncTcpState::Closed => return,
+            SyncTcpState::Closed | SyncTcpState::CloseWait => (),
             _ => unimplemented!(),
-        } 
+        }
     }
 
     fn update(&mut self) {
         let (_, packet) = self.manager.inner.borrow_mut().next(self.local);
 
-        if packet.header.rst {
+        let header = &packet.header;
+        if header.rst {
             println!("Connection is asked to be reset.");
             self.state = SyncTcpState::Closed;
             return;
@@ -190,17 +185,19 @@ impl TcpStream {
             let send = &mut self.connection.send;
 
             if self.state.can_receive() {
-                let data_start = receive.next.wrapping_sub(packet.header.sequence_number);
+                let data_start = receive.next.wrapping_sub(header.sequence_number);
                 let received_data = &packet.body[data_start as usize..];
                 self.received.extend(received_data.iter());
-                receive.next += received_data.len() as u32;
+                receive.next = receive.next.wrapping_add(received_data.len() as u32);
             }
 
             if self.state.can_send() && !self.to_send.is_empty() {
-                let acknowledged = packet.header.acknowledgment_number.wrapping_sub(send.unacknowleged);
+                let acknowledged = header
+                    .acknowledgment_number
+                    .wrapping_sub(send.unacknowleged);
                 self.to_send.drain(..acknowledged as usize);
-                send.unacknowleged = packet.header.acknowledgment_number;
-                send.window = packet.header.window_size;
+                send.unacknowleged = header.acknowledgment_number;
+                send.window = header.window_size;
 
                 let (data, _) = self.to_send.as_slices();
                 let amt = std::cmp::min(data.len(), send.window as usize);
@@ -212,10 +209,16 @@ impl TcpStream {
 
         let response = packet.respond(
             self.connection.receive.window,
-            PacketResponse::Ack(self.connection.send.unacknowleged, self.connection.receive.next),
-            data
+            PacketResponse::Ack(
+                self.connection.send.unacknowleged,
+                self.connection.receive.next,
+            ),
+            data,
         );
-        self.manager.inner.borrow_mut().send_packet(response, self.local.0, self.remote.0, 0);
+        self.manager
+            .inner
+            .borrow_mut()
+            .send_packet(response, self.local.0, self.remote.0, 0);
     }
 }
 
