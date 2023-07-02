@@ -22,7 +22,7 @@ pub struct ReceiveConnectionState {
 }
 
 impl ReceiveConnectionState {
-    pub fn is_valid_segment(&self, start: u32, len: usize) -> bool {
+    fn is_valid_segment(&self, start: u32, len: usize) -> bool {
         let before_next = self.next.wrapping_sub(1);
         match (len, self.window) {
             (0, 0) => start == self.next,
@@ -45,10 +45,41 @@ impl ReceiveConnectionState {
     }
 }
 
+impl SendConnectionState {
+    fn is_valid_ack(&self, ack: u32) -> bool {
+        is_between_wrapping(
+            self.unacknowleged.wrapping_sub(1), // It can equal send.unacknowleged
+            ack,
+            self.next.wrapping_add(1), // It can equal send.next
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ConnectionState {
     pub send: SendConnectionState,
     pub receive: ReceiveConnectionState,
+}
+
+impl ConnectionState {
+    pub fn is_valid_seq_nums(&self, packet: &TcpPacket) -> bool {
+        if !packet.header.ack {
+            return false;
+        }
+
+        let mut segment_len = packet.body.len();
+        if packet.header.syn {
+            segment_len += 1;
+        }
+        if packet.header.fin {
+            segment_len += 1;
+        }
+
+        self.send.is_valid_ack(packet.header.acknowledgment_number)
+            && self
+                .receive
+                .is_valid_segment(packet.header.sequence_number, segment_len)
+    }
 }
 
 #[derive(Default, Debug)]

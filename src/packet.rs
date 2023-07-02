@@ -22,9 +22,9 @@ impl<'a> Ipv4Packet<'a> {
 }
 
 #[derive(Debug)]
-pub struct TcpPacket<'a> {
+pub struct TcpPacket {
     pub header: TcpHeader,
-    pub body: &'a [u8],
+    pub body: Vec<u8>,
 }
 
 pub enum PacketResponse {
@@ -35,25 +35,31 @@ pub enum PacketResponse {
     Fin(u32, u32),
 }
 
-impl<'a> TcpPacket<'a> {
-    pub fn from_bytes(bytes: &'a [u8]) -> Result<Self> {
+impl TcpPacket {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let (header, body) = TcpHeader::from_slice(bytes)?;
-        Ok(Self { body, header })
+        Ok(Self {
+            body: body.into(),
+            header,
+        })
     }
 
     pub fn from_header(header: TcpHeader) -> Self {
-        Self { header, body: &[] }
+        Self {
+            header,
+            body: vec![],
+        }
     }
 
     pub fn is_checksum_valid(&self, source: [u8; 4], destination: [u8; 4]) -> bool {
         let intended = self
             .header
-            .calc_checksum_ipv4_raw(source, destination, self.body)
+            .calc_checksum_ipv4_raw(source, destination, &self.body)
             .unwrap();
         intended == self.header.checksum
     }
 
-    pub fn respond<'b>(self, window: u16, response: PacketResponse, body: &'b [u8]) -> TcpPacket<'b> {
+    pub fn respond(self, window: u16, response: PacketResponse, body: &[u8]) -> TcpPacket {
         let mut header = TcpHeader::new(
             self.header.destination_port,
             self.header.source_port,
@@ -87,6 +93,9 @@ impl<'a> TcpPacket<'a> {
                 header.fin = true;
             }
         }
-        TcpPacket { header, body }
+        TcpPacket {
+            header,
+            body: body.into(),
+        }
     }
 }
