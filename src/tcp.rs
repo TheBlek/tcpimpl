@@ -256,6 +256,38 @@ impl TcpStream {
         }
     }
 
+    fn blank_header(&self) -> TcpHeader {
+        let mut result = TcpHeader::new(
+            self.local.port,
+            self.remote.port,
+            self.connection.send.unacknowleged,
+            self.connection.receive.window,
+        );
+        result.ack = true;
+        result.acknowledgment_number = self.connection.receive.next;
+        result
+    }
+
+    fn send_next_packet(&self) {
+        let data = if self.state.can_send() && !self.to_send.is_empty() {
+            let (data, _) = self.to_send.as_slices();
+            let amt = std::cmp::min(data.len(), self.connection.send.window as usize);
+            &data[..amt]
+        } else {
+            &[]
+        };
+        let packet = TcpPacket {
+            header: self.blank_header(),
+            body: data.into(),
+        };
+        self.manager.inner.borrow_mut().send_packet(
+            packet,
+            self.local.ip,
+            self.remote.ip,
+            0,
+        );
+    }
+
     fn update(&mut self) {
         let (_, packet) = self.manager.inner.borrow_mut().next(self.local);
 
@@ -266,52 +298,33 @@ impl TcpStream {
             return;
         }
 
-        let data = if !self.connection.is_valid_seq_nums(&packet) {
+        if !self.connection.is_valid_seq_nums(&packet) {
             // The packet does not contain proper acknowledgment or segment
             // Therefore, being in synchronized state,
             // we should send an empty packet containing current state
             println!("unexpected packet");
-            &[]
-        } else {
-            self.state_transition(&packet);
-            let receive = &mut self.connection.receive;
-            let send = &mut self.connection.send;
+            return;
+        } 
+        self.state_transition(&packet);
+        let receive = &mut self.connection.receive;
+        let send = &mut self.connection.send;
 
-            if self.state.can_receive() {
-                let data_start = receive.next.wrapping_sub(header.sequence_number);
-                let received_data = &packet.body[data_start as usize..];
-                self.received.extend(received_data.iter());
-                receive.next = receive.next.wrapping_add(received_data.len() as u32);
-            }
+        if self.state.can_receive() {
+            let data_start = receive.next.wrapping_sub(header.sequence_number);
+            let received_data = &packet.body[data_start as usize..];
+            self.received.extend(received_data.iter());
+            receive.next = receive.next.wrapping_add(received_data.len() as u32);
+        }
 
-            if self.state.can_send() && !self.to_send.is_empty() {
-                let acknowledged = header
-                    .acknowledgment_number
-                    .wrapping_sub(send.unacknowleged);
-                self.to_send.drain(..acknowledged as usize);
-                send.unacknowleged = header.acknowledgment_number;
-                send.window = header.window_size;
-
-                let (data, _) = self.to_send.as_slices();
-                let amt = std::cmp::min(data.len(), send.window as usize);
-                &data[..amt]
-            } else {
-                &[]
-            }
-        };
-
-        let response = packet.respond(
-            self.connection.receive.window,
-            PacketResponse::Ack(
-                self.connection.send.unacknowleged,
-                self.connection.receive.next,
-            ),
-            data,
-        );
-        self.manager
-            .inner
-            .borrow_mut()
-            .send_packet(response, self.local.ip, self.remote.ip, 0);
+        if self.state.can_send() && !self.to_send.is_empty() {
+            let acknowledged = header
+                .acknowledgment_number
+                .wrapping_sub(send.unacknowleged);
+            self.to_send.drain(..acknowledged as usize);
+            send.unacknowleged = header.acknowledgment_number;
+            send.window = header.window_size;
+        }
+        self.send_next_packet();
     }
 }
 
@@ -343,6 +356,7 @@ impl Write for TcpStream {
             return Err(std::io::ErrorKind::ConnectionReset.into());
         }
         self.to_send.extend(buf.iter());
+        self.send_next_packet();
         while !self.to_send.is_empty() {
             self.update()
         }
@@ -577,4 +591,3 @@ impl ConnectionManager {
         }
     }
 }
-
