@@ -1,5 +1,8 @@
 use crate::packet::*;
+use crate::address::*;
+
 use anyhow::Result;
+
 use etherparse::{IpNumber, Ipv4Header, TcpHeader};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -57,7 +60,7 @@ impl SendConnectionState {
             self.unacknowleged.wrapping_sub(1), // It can equal send.unacknowleged
             ack,
             self.next.wrapping_add(1), // It can equal send.next
-        )
+            )
     }
 }
 
@@ -83,37 +86,8 @@ impl ConnectionState {
 
         self.send.is_valid_ack(packet.header.acknowledgment_number)
             && self
-                .receive
-                .is_valid_segment(packet.header.sequence_number, segment_len)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct Addr {
-    ip: [u8; 4],
-    port: u16,
-}
-
-impl From<([u8; 4], u16)> for Addr {
-    fn from((ip, port): ([u8; 4], u16)) -> Self {
-        Self { ip, port }
-    }
-}
-
-impl TryFrom<&str> for Addr {
-    type Error = anyhow::Error;
-
-    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
-        let mut iter = value.split(':');
-        let address = iter
-            .next()
-            .unwrap()
-            .split('.')
-            .map(|s| s.parse::<u8>().unwrap())
-            .collect::<Vec<_>>()[..4]
-            .try_into()?;
-        let port = iter.next().unwrap().parse().unwrap();
-        Ok(Addr { ip: address, port })
+            .receive
+            .is_valid_segment(packet.header.sequence_number, segment_len)
     }
 }
 
@@ -144,27 +118,36 @@ impl SyncTcpState {
         !matches!(
             self,
             SyncTcpState::CloseWait | SyncTcpState::Closed | SyncTcpState::LastAck
-        )
+            )
     }
 
     fn can_send(&self) -> bool {
         !matches!(
             self,
             SyncTcpState::FinWait1
-                | SyncTcpState::Closed
-                | SyncTcpState::FinWait2
-                | SyncTcpState::Closing
-        )
+            | SyncTcpState::Closed
+            | SyncTcpState::FinWait2
+            | SyncTcpState::Closing
+            )
     }
 }
 
+struct RetransmitPacket {
+    packet: TcpPacket,
+    last_sent: std::time::Instant,
+    timeout: std::time::Duration,
+}
+
 pub struct TcpStream {
+    manager: ConnectionManager,
     connection: ConnectionState,
     state: SyncTcpState,
-    manager: ConnectionManager,
     received: VecDeque<u8>,
     to_send: VecDeque<u8>,
-    local: Addr, // TODO: Type for an address
+    unacked: Option<RetransmitPacket>,
+    last_round_trip: std::time::Duration,
+
+    local: Addr,
     remote: Addr,
 }
 
@@ -175,7 +158,7 @@ impl TcpStream {
             self.remote.port,
             self.connection.send.unacknowleged,
             self.connection.receive.window,
-        );
+            );
         result.ack = true;
         result.acknowledgment_number = self.connection.receive.next;
         result
@@ -381,7 +364,7 @@ impl InnerConnectionManager {
         source: [u8; 4],
         destination: [u8; 4],
         eth_header: u16,
-    ) {
+        ) {
         packet.header.checksum = packet
             .header
             .calc_checksum_ipv4_raw(source, destination, &packet.body)
@@ -393,7 +376,7 @@ impl InnerConnectionManager {
             IpNumber::Tcp as u8,
             source,
             destination,
-        );
+            );
 
         self.tun
             .write_all(&eth_header.to_be_bytes())
@@ -475,7 +458,7 @@ impl ConnectionManager {
             .platform(|config| {
                 config.packet_information(true);
             })
-            .up();
+        .up();
 
         Ok(ConnectionManager {
             inner: Rc::new(RefCell::new(InnerConnectionManager {
@@ -486,102 +469,104 @@ impl ConnectionManager {
 
     // TODO: make a trait IntoAddr or smth
     pub fn accept<T>(&mut self, addr: T) -> TcpStream
-    where
+        where
         T: TryInto<Addr>,
         <T as TryInto<Addr>>::Error: Debug,
-    {
-        let mut state = UnsyncTcpState::Listen;
-        let address = addr.try_into().expect("invalid address");
-        let mut manager = self.inner.borrow_mut();
-        let (connection_state, remote) = loop {
-            let (remote, packet) = manager.next(address);
-            let in_header = &packet.header;
-            if let Some(response) = match state {
-                UnsyncTcpState::Listen => match (in_header.syn, in_header.ack) {
-                    (true, false) => {
-                        let isn = 0; // TODO: use MD5 on some state. RFC 1948.
-                        let new_state = ConnectionState {
-                            send: SendConnectionState {
-                                unacknowleged: isn,
-                                window: in_header.window_size,
-                                isn,
-                                urgent_pointer: false,
-                                next: isn.wrapping_add(in_header.window_size as u32),
-                            },
-                            receive: ReceiveConnectionState {
-                                next: in_header.sequence_number.wrapping_add(1),
-                                window: Self::RECIEVE_WINDOW_SIZE,
-                                isn: in_header.sequence_number,
-                            },
-                        };
-                        state = UnsyncTcpState::SynReceived(new_state);
-                        Some(packet.respond(
-                            Self::RECIEVE_WINDOW_SIZE,
-                            PacketResponse::SynAck(
-                                new_state.send.unacknowleged,
-                                new_state.receive.next,
-                            ),
-                            &[],
-                        ))
-                    }
-                    (_, ack) => {
-                        let seq = if ack {
-                            in_header.acknowledgment_number
-                        } else {
-                            0
-                        };
-                        Some(packet.respond(
-                            Self::RECIEVE_WINDOW_SIZE,
-                            PacketResponse::Reset(seq),
-                            &[],
-                        ))
-                    }
+        {
+            let mut state = UnsyncTcpState::Listen;
+            let address = addr.try_into().expect("invalid address");
+            let mut manager = self.inner.borrow_mut();
+            let (connection_state, remote) = loop {
+                let (remote, packet) = manager.next(address);
+                let in_header = &packet.header;
+                if let Some(response) = match state {
+                    UnsyncTcpState::Listen => match (in_header.syn, in_header.ack) {
+                        (true, false) => {
+                            let isn = 0; // TODO: use MD5 on some state. RFC 1948.
+                            let new_state = ConnectionState {
+                                send: SendConnectionState {
+                                    unacknowleged: isn,
+                                    window: in_header.window_size,
+                                    isn,
+                                    urgent_pointer: false,
+                                    next: isn.wrapping_add(in_header.window_size as u32),
+                                },
+                                receive: ReceiveConnectionState {
+                                    next: in_header.sequence_number.wrapping_add(1),
+                                    window: Self::RECIEVE_WINDOW_SIZE,
+                                    isn: in_header.sequence_number,
+                                },
+                            };
+                            state = UnsyncTcpState::SynReceived(new_state);
+                            Some(packet.respond(
+                                    Self::RECIEVE_WINDOW_SIZE,
+                                    PacketResponse::SynAck(
+                                        new_state.send.unacknowleged,
+                                        new_state.receive.next,
+                                        ),
+                                        &[],
+                                        ))
+                        }
+                        (_, ack) => {
+                            let seq = if ack {
+                                in_header.acknowledgment_number
+                            } else {
+                                0
+                            };
+                            Some(packet.respond(
+                                    Self::RECIEVE_WINDOW_SIZE,
+                                    PacketResponse::Reset(seq),
+                                    &[],
+                                    ))
+                        }
+                    },
+                    UnsyncTcpState::SynReceived(mut connection_state) => match (
+                        in_header.rst,
+                        in_header.syn,
+                        in_header.ack,
+                        in_header.acknowledgment_number,
+                        ) {
+                        (true, ..) => {
+                            state = UnsyncTcpState::Listen;
+                            None
+                        }
+                        (_, false, true, ack)
+                            if ack == connection_state.send.unacknowleged.wrapping_add(1) =>
+                            {
+                                connection_state.send.unacknowleged = ack;
+                                break (connection_state, (remote, packet.header.source_port));
+                            }
+                        (_, _, ack, _) => {
+                            state = UnsyncTcpState::Listen;
+                            let seq = if ack {
+                                in_header.acknowledgment_number
+                            } else {
+                                0
+                            };
+                            Some(packet.respond(
+                                    connection_state.send.window,
+                                    PacketResponse::Reset(seq),
+                                    &[],
+                                    ))
+                        }
+                    },
+                        UnsyncTcpState::SynSent(_) => panic!(),
+                } {
+                    manager.send_packet(response, address.ip, remote, 0)
+                }
+            };
+            TcpStream {
+                local: address,
+                remote: remote.into(),
+                connection: connection_state,
+                manager: ConnectionManager {
+                    inner: Rc::clone(&self.inner),
                 },
-                UnsyncTcpState::SynReceived(mut connection_state) => match (
-                    in_header.rst,
-                    in_header.syn,
-                    in_header.ack,
-                    in_header.acknowledgment_number,
-                ) {
-                    (true, ..) => {
-                        state = UnsyncTcpState::Listen;
-                        None
-                    }
-                    (_, false, true, ack)
-                        if ack == connection_state.send.unacknowleged.wrapping_add(1) =>
-                    {
-                        connection_state.send.unacknowleged = ack;
-                        break (connection_state, (remote, packet.header.source_port));
-                    }
-                    (_, _, ack, _) => {
-                        state = UnsyncTcpState::Listen;
-                        let seq = if ack {
-                            in_header.acknowledgment_number
-                        } else {
-                            0
-                        };
-                        Some(packet.respond(
-                            connection_state.send.window,
-                            PacketResponse::Reset(seq),
-                            &[],
-                        ))
-                    }
-                },
-                UnsyncTcpState::SynSent(_) => panic!(),
-            } {
-                manager.send_packet(response, address.ip, remote, 0)
+                received: VecDeque::new(),
+                to_send: VecDeque::new(),
+                state: SyncTcpState::Established,
+                last_round_trip: std::time::Duration::from_secs(1),
+                unacked: None,
             }
-        };
-        TcpStream {
-            local: address,
-            remote: remote.into(),
-            connection: connection_state,
-            manager: ConnectionManager {
-                inner: Rc::clone(&self.inner),
-            },
-            received: VecDeque::new(),
-            to_send: VecDeque::new(),
-            state: SyncTcpState::Established,
         }
-    }
 }
