@@ -169,28 +169,34 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
+    fn blank_header(&self) -> TcpHeader {
+        let mut result = TcpHeader::new(
+            self.local.port,
+            self.remote.port,
+            self.connection.send.unacknowleged,
+            self.connection.receive.window,
+        );
+        result.ack = true;
+        result.acknowledgment_number = self.connection.receive.next;
+        result
+    }
+
+    fn send_packet(&self, packet: TcpPacket) {
+        self.manager
+            .inner
+            .borrow_mut()
+            .send_packet(packet, self.local.ip, self.remote.ip, 0);
+    }
+
     pub fn close(&mut self) {
         if self.state == SyncTcpState::Closed {
             return;
         }
         match self.state {
             SyncTcpState::Established | SyncTcpState::CloseWait => {
-                let mut header = TcpHeader::new(
-                    self.local.port,
-                    self.remote.port,
-                    self.connection.send.unacknowleged,
-                    0,
-                );
-
-                header.ack = true;
+                let mut header = self.blank_header();
                 header.fin = true;
-                header.acknowledgment_number = self.connection.receive.next;
-                self.manager.inner.borrow_mut().send_packet(
-                    TcpPacket::from_header(header),
-                    self.local.ip,
-                    self.remote.ip,
-                    0,
-                );
+                self.send_packet(TcpPacket::from_header(header));
                 self.state = if self.state == SyncTcpState::Established {
                     SyncTcpState::FinWait1
                 } else {
@@ -256,18 +262,6 @@ impl TcpStream {
         }
     }
 
-    fn blank_header(&self) -> TcpHeader {
-        let mut result = TcpHeader::new(
-            self.local.port,
-            self.remote.port,
-            self.connection.send.unacknowleged,
-            self.connection.receive.window,
-        );
-        result.ack = true;
-        result.acknowledgment_number = self.connection.receive.next;
-        result
-    }
-
     fn send_next_packet(&self) {
         let data = if self.state.can_send() && !self.to_send.is_empty() {
             let (data, _) = self.to_send.as_slices();
@@ -280,10 +274,7 @@ impl TcpStream {
             header: self.blank_header(),
             body: data.into(),
         };
-        self.manager
-            .inner
-            .borrow_mut()
-            .send_packet(packet, self.local.ip, self.remote.ip, 0);
+        self.send_packet(packet);
     }
 
     fn update(&mut self) {
