@@ -222,7 +222,7 @@ impl TcpStream {
                 }
             }
             SyncTcpState::LastAck => {
-                if packet.header.acknowledgment_number == send.unacknowleged + 1 {
+                if packet.header.acknowledgment_number == send.unacknowleged.wrapping_add(1) {
                     self.state = SyncTcpState::Closed;
                 }
             }
@@ -233,7 +233,7 @@ impl TcpStream {
                     self.state = SyncTcpState::Closing;
                 }
 
-                if packet.header.acknowledgment_number == send.unacknowleged + 1 {
+                if packet.header.acknowledgment_number == send.unacknowleged.wrapping_add(1) {
                     send.unacknowleged = send.unacknowleged.wrapping_add(1);
                     self.state = SyncTcpState::FinWait2;
                 }
@@ -247,7 +247,7 @@ impl TcpStream {
                 }
             }
             SyncTcpState::Closing => {
-                if packet.header.acknowledgment_number == send.unacknowleged + 1 {
+                if packet.header.acknowledgment_number == send.unacknowleged.wrapping_add(1) {
                     self.state = SyncTcpState::Closed;
                 }
             }
@@ -280,12 +280,10 @@ impl TcpStream {
             header: self.blank_header(),
             body: data.into(),
         };
-        self.manager.inner.borrow_mut().send_packet(
-            packet,
-            self.local.ip,
-            self.remote.ip,
-            0,
-        );
+        self.manager
+            .inner
+            .borrow_mut()
+            .send_packet(packet, self.local.ip, self.remote.ip, 0);
     }
 
     fn update(&mut self) {
@@ -304,7 +302,7 @@ impl TcpStream {
             // we should send an empty packet containing current state
             println!("unexpected packet");
             return;
-        } 
+        }
         self.state_transition(&packet);
         let receive = &mut self.connection.receive;
         let send = &mut self.connection.send;
@@ -323,6 +321,9 @@ impl TcpStream {
             self.to_send.drain(..acknowledged as usize);
             send.unacknowleged = header.acknowledgment_number;
             send.window = header.window_size;
+            send.next = header
+                .acknowledgment_number
+                .wrapping_add(send.window as u32);
         }
         self.send_next_packet();
     }
@@ -514,10 +515,10 @@ impl ConnectionManager {
                                 window: in_header.window_size,
                                 isn,
                                 urgent_pointer: false,
-                                next: isn + Self::RECIEVE_WINDOW_SIZE as u32,
+                                next: isn.wrapping_add(in_header.window_size as u32),
                             },
                             receive: ReceiveConnectionState {
-                                next: in_header.sequence_number + 1,
+                                next: in_header.sequence_number.wrapping_add(1),
                                 window: Self::RECIEVE_WINDOW_SIZE,
                                 isn: in_header.sequence_number,
                             },
@@ -555,7 +556,9 @@ impl ConnectionManager {
                         state = UnsyncTcpState::Listen;
                         None
                     }
-                    (_, false, true, ack) if ack == connection_state.send.unacknowleged + 1 => {
+                    (_, false, true, ack)
+                        if ack == connection_state.send.unacknowleged.wrapping_add(1) =>
+                    {
                         connection_state.send.unacknowleged = ack;
                         break (connection_state, (remote, packet.header.source_port));
                     }
