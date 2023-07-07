@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, Debug)]
+#[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub struct Addr {
     pub ip: [u8; 4],
     pub port: u16,
@@ -19,10 +19,16 @@ impl TryFrom<&str> for Addr {
             .next()
             .unwrap()
             .split('.')
-            .map(|s| s.parse::<u8>().unwrap())
+            .filter_map(|s| s.parse::<u8>().ok())
             .collect::<Vec<_>>()[..4]
             .try_into()?;
-        let port = iter.next().unwrap().parse().unwrap();
+        let port = iter.next().unwrap().parse()?;
         Ok(Addr { ip: address, port })
     }
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+pub struct ConnectionId {
+    pub local: Addr,
+    pub remote: Addr,
 }
