@@ -5,7 +5,6 @@ use anyhow::Result;
 
 use etherparse::{IpNumber, Ipv4Header, TcpHeader};
 use std::collections::{HashMap, VecDeque};
-// use std::error::Error;
 use std::fmt::Debug;
 use std::io::{BufWriter, ErrorKind, Read, Write};
 use std::sync::{Arc, Mutex};
@@ -371,14 +370,38 @@ impl Read for TcpStreamHandle {
 
 impl Drop for TcpStreamHandle {
     fn drop(&mut self) {
-        let mut manager = self.manager
+        let mut manager_lock = self.manager
             .inner
             .lock()
             .unwrap();
+        let manager = &mut *manager_lock;
         let stream = manager
             .connections
             .get_mut(&self.id)
             .unwrap();
+        stream.close(&mut manager.tun);
+        std::mem::drop(manager_lock);
+        loop {
+            let mut manager = self.manager
+                .inner
+                .lock()
+                .unwrap();
+            let stream = manager
+                .connections
+                .get_mut(&self.id)
+                .unwrap();
+
+            if let SyncTcpState::Closed | SyncTcpState::FinWait2 = stream.state {
+                break;
+            }
+            std::mem::drop(manager);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let mut manager = self.manager
+            .inner
+            .lock()
+            .unwrap();
+        manager.connections.remove(&self.id);
     }
 }
 
