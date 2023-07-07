@@ -382,23 +382,64 @@ impl Drop for TcpStreamHandle {
     }
 }
 
-// impl Write for TcpStream {
-//     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-//         if !self.state.can_send() {
-//             return Err(std::io::ErrorKind::ConnectionReset.into());
-//         }
-//         self.to_send.extend(buf.iter());
-//         self.send_next_packet();
-//         while !self.to_send.is_empty() {
-//             self.update()
-//         }
-//         Ok(buf.len())
-//     }
+impl Write for TcpStreamHandle {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut manager_lock = self
+            .manager
+            .inner
+            .lock()
+            .unwrap();
+        let manager = &mut *manager_lock; 
+        let stream = manager
+            .connections
+            .get_mut(&self.id)
+            .ok_or::<std::io::Error>(std::io::ErrorKind::ConnectionAborted.into())?;
 
-//     fn flush(&mut self) -> std::io::Result<()> {
-//         todo!()
-//     }
-// }
+        if !stream.state.can_send() {
+            return Err(std::io::ErrorKind::ConnectionReset.into());
+        }
+        stream.to_send.extend(buf.iter());
+        stream.send_next_packet(&mut manager.tun);
+        std::mem::drop(manager_lock);
+
+        loop {
+            let manager = self
+                .manager
+                .inner
+                .lock()
+                .unwrap();
+            let stream = manager
+                .connections
+                .get(&self.id)
+                .ok_or::<std::io::Error>(std::io::ErrorKind::ConnectionAborted.into())?;
+            if stream.to_send.len() < buf.len() {
+                break;
+            }
+            std::mem::drop(manager);
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        loop {
+            let manager = self
+                .manager
+                .inner
+                .lock()
+                .unwrap();
+            let stream = manager
+                .connections
+                .get(&self.id)
+                .ok_or::<std::io::Error>(std::io::ErrorKind::ConnectionAborted.into())?;
+            if stream.to_send.is_empty() {
+                break Ok(());
+            }
+            std::mem::drop(manager);
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
 
 enum PotentialConnection {
     None(UnsyncTcpState),
