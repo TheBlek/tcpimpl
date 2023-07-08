@@ -165,7 +165,7 @@ impl TcpStream {
             let amt = min(data.len(), window);
             let mut res: Vec<_> = data[..amt].into();
             if amt == data.len() {
-                let remaining_amt = min(other.len(), window - amt); 
+                let remaining_amt = min(other.len(), window - amt);
                 println!("I actually extended by {}", remaining_amt);
                 res.extend_from_slice(&other[..remaining_amt]);
             }
@@ -195,10 +195,7 @@ impl TcpStream {
             return;
         }
 
-        if !self.connection.is_valid_seq_nums(&packet)
-            // TODO: Buffer packets before presenting them to address out-of-order
-            // packets problem
-            || header.sequence_number != self.connection.receive.next {
+        if !self.connection.is_valid_seq_nums(&packet) {
             // The packet does not contain proper acknowledgment or segment
             // Therefore, being in synchronized state,
             // we should send an empty packet containing current state
@@ -210,7 +207,9 @@ impl TcpStream {
         let receive = &mut self.connection.receive;
         let send = &mut self.connection.send;
 
-        let received = if self.state.can_receive() {
+        // TODO: Buffer packets before presenting them to address out-of-order
+        // packets problem
+        let received = if self.state.can_receive() && header.sequence_number == receive.next {
             let data_start = receive.next.wrapping_sub(header.sequence_number);
             let received_data = &packet.body[data_start as usize..];
             self.received.extend(received_data.iter());
@@ -366,7 +365,7 @@ impl Retransmission {
         let timeout = Self::TIMEOUT_UBOUND.min(Self::TIMEOUT_LBOUND.max(Self::BETA * self.srtt));
         self.last_sent.elapsed().as_secs_f64() >= timeout
     }
-    
+
     fn recalculate_srtt(&mut self, round_trip_time: f64) {
         self.srtt = (Self::ALPHA * self.srtt) + ((1f64 - Self::ALPHA) * round_trip_time);
     }
@@ -536,14 +535,42 @@ impl ConnectionManager {
                 let expired = manager
                     .connections
                     .values_mut()
-                    .filter(|stream| stream.retransmission.as_ref().is_some_and(|x| x.due()));
+                    .filter(|stream| stream.retransmission.as_ref().is_some_and(|x| x.due()))
+                    .map(|stream| {
+                        (
+                            &mut stream.id,
+                            stream.retransmission.as_mut().unwrap(),
+                            stream.round_trip_time,
+                        )
+                    })
+                    .chain(
+                        manager
+                            .nonsync
+                            .values_mut()
+                            .filter_map(|x| {
+                                if let PotentialConnection::None(state) = x {
+                                    Some(state)
+                                } else {
+                                    None
+                                }
+                            })
+                            .filter_map(|state| {
+                                if let UnsyncTcpState::SynReceived(_, id, retrans)
+                                | UnsyncTcpState::SynSent(_, id, retrans) = state
+                                {
+                                    if retrans.due() {
+                                        return Some((id, retrans, 1.0));
+                                    }
+                                }
+                                None
+                            }),
+                    );
 
-                for stream in expired {
-                    let mut retransmission = stream.retransmission.take().unwrap();
-                    stream.send_packet(&mut manager.tun, &mut retransmission.packet);
+                let tun = &mut manager.tun;
+                for (id, retransmission, rtt) in expired {
+                    tun.write_packet(&mut retransmission.packet, id.local.ip, id.remote.ip, 0);
                     retransmission.last_sent = std::time::Instant::now();
-                    retransmission.recalculate_srtt(stream.round_trip_time);
-                    stream.retransmission = Some(retransmission);
+                    retransmission.recalculate_srtt(rtt);
                 }
                 std::mem::drop(guarded_manager);
 

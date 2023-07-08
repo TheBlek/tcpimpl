@@ -131,10 +131,10 @@ impl SyncTcpState {
     }
 }
 
-pub enum UnsyncTcpState {
+pub(super) enum UnsyncTcpState {
     Listen,
-    SynReceived(ConnectionState),
-    SynSent(ConnectionState),
+    SynReceived(ConnectionState, ConnectionId, Retransmission),
+    SynSent(ConnectionState, ConnectionId, Retransmission),
 }
 
 impl UnsyncTcpState {
@@ -173,8 +173,8 @@ impl UnsyncTcpState {
                         ),
                         &[],
                     );
-                    // let retransmit = Retransmission::from_packet(packet);
-                    *self = UnsyncTcpState::SynReceived(new_state);
+                    let retransmit = Retransmission::from_packet(packet.clone());
+                    *self = UnsyncTcpState::SynReceived(new_state, id.clone(), retransmit);
                     Some(packet)
                 }
                 (_, ack) => {
@@ -190,7 +190,7 @@ impl UnsyncTcpState {
                     ))
                 }
             },
-            UnsyncTcpState::SynReceived(mut connection_state) => match (
+            UnsyncTcpState::SynReceived(mut connection_state, ..) => match (
                 in_header.rst,
                 in_header.syn,
                 in_header.ack,

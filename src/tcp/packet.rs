@@ -21,7 +21,7 @@ impl<'a> Ipv4Packet<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TcpPacket {
     pub header: TcpHeader,
     pub body: Vec<u8>,
