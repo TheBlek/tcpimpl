@@ -18,7 +18,7 @@ use std::thread;
 trait PacketWrite: Write + Sized {
     fn write_packet(
         &mut self,
-        mut packet: TcpPacket,
+        packet: &mut TcpPacket,
         source: [u8; 4],
         destination: [u8; 4],
         eth_header: u16,
@@ -64,6 +64,8 @@ pub struct TcpStream {
     to_send: VecDeque<u8>,
 
     id: ConnectionId,
+    retransmission: Option<Retransmission>,
+    round_trip_time: f64,
 }
 
 impl TcpStream {
@@ -79,7 +81,7 @@ impl TcpStream {
         result
     }
 
-    fn send_packet(&self, tun: &mut impl PacketWrite, packet: TcpPacket) {
+    fn send_packet(&self, tun: &mut impl PacketWrite, packet: &mut TcpPacket) {
         tun.write_packet(packet, self.id.local.ip, self.id.remote.ip, 0);
     }
 
@@ -91,7 +93,13 @@ impl TcpStream {
             SyncTcpState::Established | SyncTcpState::CloseWait => {
                 let mut header = self.blank_header();
                 header.fin = true;
-                self.send_packet(tun, TcpPacket::from_header(header));
+                let mut packet = TcpPacket::from_header(header);
+                self.send_packet(tun, &mut packet);
+                self.retransmission = Some(Retransmission {
+                    packet,
+                    last_sent: std::time::Instant::now(),
+                    srtt: self.round_trip_time,
+                });
                 self.state = if self.state == SyncTcpState::Established {
                     SyncTcpState::FinWait1
                 } else {
@@ -149,19 +157,34 @@ impl TcpStream {
         }
     }
 
-    fn send_next_packet(&self, tun: &mut impl PacketWrite) {
+    fn send_next_packet(&mut self, tun: &mut impl PacketWrite) {
         let data = if self.state.can_send() && !self.to_send.is_empty() {
-            let (data, _) = self.to_send.as_slices();
-            let amt = std::cmp::min(data.len(), self.connection.send.window as usize);
-            &data[..amt]
+            use std::cmp::min;
+            let (data, other) = self.to_send.as_slices();
+            let window = self.connection.send.window as usize;
+            let amt = min(data.len(), window);
+            let mut res: Vec<_> = data[..amt].into();
+            if amt == data.len() {
+                let remaining_amt = min(other.len(), window - amt); 
+                println!("I actually extended by {}", remaining_amt);
+                res.extend_from_slice(&other[..remaining_amt]);
+            }
+            res
         } else {
-            &[]
+            vec![]
         };
-        let packet = TcpPacket {
+        let mut packet = TcpPacket {
             header: self.blank_header(),
-            body: data.into(),
+            body: data,
         };
-        self.send_packet(tun, packet);
+        self.send_packet(tun, &mut packet);
+        if !packet.body.is_empty() {
+            self.retransmission = Some(Retransmission {
+                packet,
+                last_sent: std::time::Instant::now(),
+                srtt: self.round_trip_time,
+            });
+        }
     }
 
     fn on_packet(&mut self, tun: &mut impl PacketWrite, packet: TcpPacket) {
@@ -172,11 +195,15 @@ impl TcpStream {
             return;
         }
 
-        if !self.connection.is_valid_seq_nums(&packet) {
+        if !self.connection.is_valid_seq_nums(&packet)
+            // TODO: Buffer packets before presenting them to address out-of-order
+            // packets problem
+            || header.sequence_number != self.connection.receive.next {
             // The packet does not contain proper acknowledgment or segment
             // Therefore, being in synchronized state,
             // we should send an empty packet containing current state
             println!("unexpected packet");
+            self.send_next_packet(tun);
             return;
         }
         self.state_transition(&packet);
@@ -203,6 +230,14 @@ impl TcpStream {
             send.next = header
                 .acknowledgment_number
                 .wrapping_add(send.window as u32);
+
+            if let Some(retransmission) = &self.retransmission {
+                if acknowledged > 0 {
+                    let elapsed = retransmission.last_sent.elapsed().as_secs_f64();
+                    self.round_trip_time = (self.round_trip_time + elapsed) / 2.0;
+                    self.retransmission = None;
+                }
+            }
         }
         if received || (self.state.can_send() && !self.to_send.is_empty()) {
             self.send_next_packet(tun);
@@ -314,6 +349,37 @@ impl Write for TcpStreamHandle {
     }
 }
 
+struct Retransmission {
+    packet: TcpPacket,
+    last_sent: std::time::Instant,
+    srtt: f64,
+}
+
+// Timeout procedure is following an example in RFC 793
+impl Retransmission {
+    const ALPHA: f64 = 0.8;
+    const BETA: f64 = 1.2;
+    const TIMEOUT_UBOUND: f64 = 10.0;
+    const TIMEOUT_LBOUND: f64 = 0.5;
+
+    fn due(&self) -> bool {
+        let timeout = Self::TIMEOUT_UBOUND.min(Self::TIMEOUT_LBOUND.max(Self::BETA * self.srtt));
+        self.last_sent.elapsed().as_secs_f64() >= timeout
+    }
+    
+    fn recalculate_srtt(&mut self, round_trip_time: f64) {
+        self.srtt = (Self::ALPHA * self.srtt) + ((1f64 - Self::ALPHA) * round_trip_time);
+    }
+
+    fn from_packet(packet: TcpPacket) -> Self {
+        Self {
+            packet,
+            last_sent: std::time::Instant::now(),
+            srtt: 1.0,
+        }
+    }
+}
+
 enum PotentialConnection {
     None(UnsyncTcpState),
     Established(ConnectionId),
@@ -342,6 +408,7 @@ impl std::ops::Deref for ConnectionManager {
         &self.inner
     }
 }
+// TODO: Drop for ConnectionManager. Do we need to drop all the conneciton properly?
 
 impl InnerConnectionManager {
     // TODO: make an iterator over the packets. (But what about writing?)
@@ -456,6 +523,8 @@ impl ConnectionManager {
                                     received: VecDeque::new(),
                                     to_send: VecDeque::new(),
                                     state: SyncTcpState::Established,
+                                    retransmission: None,
+                                    round_trip_time: 1.0,
                                 });
                             if let Some(stream) = potential_stream {
                                 nonsync.insert(id.local, PotentialConnection::Established(id));
@@ -463,6 +532,18 @@ impl ConnectionManager {
                             }
                         }
                     }
+                }
+                let expired = manager
+                    .connections
+                    .values_mut()
+                    .filter(|stream| stream.retransmission.as_ref().is_some_and(|x| x.due()));
+
+                for stream in expired {
+                    let mut retransmission = stream.retransmission.take().unwrap();
+                    stream.send_packet(&mut manager.tun, &mut retransmission.packet);
+                    retransmission.last_sent = std::time::Instant::now();
+                    retransmission.recalculate_srtt(stream.round_trip_time);
+                    stream.retransmission = Some(retransmission);
                 }
                 std::mem::drop(guarded_manager);
 

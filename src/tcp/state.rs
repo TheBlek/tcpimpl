@@ -165,15 +165,17 @@ impl UnsyncTcpState {
                             isn: in_header.sequence_number,
                         },
                     };
-                    *self = UnsyncTcpState::SynReceived(new_state);
-                    Some(packet.respond(
+                    let packet = packet.respond(
                         Self::RECIEVE_WINDOW_SIZE,
                         PacketResponse::SynAck(
                             new_state.send.unacknowleged,
                             new_state.receive.next,
                         ),
                         &[],
-                    ))
+                    );
+                    // let retransmit = Retransmission::from_packet(packet);
+                    *self = UnsyncTcpState::SynReceived(new_state);
+                    Some(packet)
                 }
                 (_, ack) => {
                     let seq = if ack {
@@ -218,11 +220,11 @@ impl UnsyncTcpState {
                     ))
                 }
             },
-            UnsyncTcpState::SynSent(_) => panic!(),
+            UnsyncTcpState::SynSent(..) => panic!(),
         };
 
-        if let Some(response_packet) = response {
-            tun.write_packet(response_packet, id.local.ip, id.remote.ip, 0)
+        if let Some(mut response_packet) = response {
+            tun.write_packet(&mut response_packet, id.local.ip, id.remote.ip, 0)
         }
 
         None
