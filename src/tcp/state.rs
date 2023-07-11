@@ -22,6 +22,14 @@ pub struct ReceiveConnectionState {
 }
 
 impl ReceiveConnectionState {
+    fn new(isn: u32) -> Self {
+        Self {
+            next: isn.wrapping_add(1),
+            isn,
+            window: UnsyncTcpState::RECIEVE_WINDOW_SIZE,
+        }
+    }
+
     fn is_valid_segment(&self, start: u32, len: usize) -> bool {
         let before_next = self.next.wrapping_sub(1);
         match (len, self.window) {
@@ -46,6 +54,16 @@ impl ReceiveConnectionState {
 }
 
 impl SendConnectionState {
+    fn new(isn: u32, window_size: u16) -> Self {
+        SendConnectionState {
+            unacknowleged: isn,
+            window: window_size,
+            isn,
+            urgent_pointer: false,
+            next: isn.wrapping_add(window_size as u32),
+        }
+    }
+
     fn is_valid_ack(&self, ack: u32) -> bool {
         is_between_wrapping(
             self.unacknowleged.wrapping_sub(1), // It can equal send.unacknowleged
@@ -134,11 +152,11 @@ impl SyncTcpState {
 pub(super) enum UnsyncTcpState {
     Listen,
     SynReceived(ConnectionState, ConnectionId, Retransmission),
-    SynSent(ConnectionState, ConnectionId, Retransmission),
+    SynSent(u32, ConnectionId, Retransmission),
 }
 
 impl UnsyncTcpState {
-    const RECIEVE_WINDOW_SIZE: u16 = 200;
+    pub(super) const RECIEVE_WINDOW_SIZE: u16 = 200;
 
     pub(super) fn on_packet(
         &mut self,
@@ -152,18 +170,8 @@ impl UnsyncTcpState {
                 (true, false) => {
                     let isn = 0; // TODO: use MD5 on some state. RFC 1948.
                     let new_state = ConnectionState {
-                        send: SendConnectionState {
-                            unacknowleged: isn,
-                            window: in_header.window_size,
-                            isn,
-                            urgent_pointer: false,
-                            next: isn.wrapping_add(in_header.window_size as u32),
-                        },
-                        receive: ReceiveConnectionState {
-                            next: in_header.sequence_number.wrapping_add(1),
-                            window: Self::RECIEVE_WINDOW_SIZE,
-                            isn: in_header.sequence_number,
-                        },
+                        send: SendConnectionState::new(isn, in_header.window_size),
+                        receive: ReceiveConnectionState::new(in_header.sequence_number),
                     };
                     let packet = packet.respond(
                         Self::RECIEVE_WINDOW_SIZE,
@@ -183,11 +191,7 @@ impl UnsyncTcpState {
                     } else {
                         0
                     };
-                    Some(packet.respond(
-                        Self::RECIEVE_WINDOW_SIZE,
-                        PacketResponse::Reset(seq),
-                        &[],
-                    ))
+                    Some(packet.respond(Self::RECIEVE_WINDOW_SIZE, PacketResponse::Reset(seq), &[]))
                 }
             },
             UnsyncTcpState::SynReceived(mut connection_state, ..) => match (
@@ -220,11 +224,58 @@ impl UnsyncTcpState {
                     ))
                 }
             },
-            UnsyncTcpState::SynSent(..) => panic!(),
+            UnsyncTcpState::SynSent(isn, id, retransmission) => match (
+                in_header.rst,
+                in_header.syn,
+                in_header.ack,
+                in_header.acknowledgment_number,
+            ) {
+                (true, ..) => {
+                    *self = UnsyncTcpState::Listen;
+                    None
+                }
+                (_, true, ack, ack_num) => {
+                    let new_state = ConnectionState {
+                        send: SendConnectionState::new(*isn, in_header.window_size),
+                        receive: ReceiveConnectionState::new(in_header.sequence_number),
+                    };
+                    let mut packet = TcpPacket::from_header(TcpHeader::new(
+                        id.local.port,
+                        id.remote.port,
+                        new_state.send.unacknowleged,
+                        UnsyncTcpState::RECIEVE_WINDOW_SIZE,
+                    ));
+                    packet.header.ack = true;
+                    packet.header.acknowledgment_number = new_state.receive.next;
+
+                    tun.write_packet(&mut packet, id);
+
+                    if ack && ack_num == isn.wrapping_add(1) {
+                        return Some(new_state);
+                    }
+
+                    *self = UnsyncTcpState::SynReceived(
+                        new_state,
+                        id.clone(), // TODO: This clone *theoretically* can be avoided
+                        Retransmission::from_packet(packet.clone()),
+                    );
+                    None
+                }
+                (_, _, ack, _) => {
+                    *self = UnsyncTcpState::Listen;
+                    let seq = if ack {
+                        in_header.acknowledgment_number
+                    } else {
+                        0
+                    };
+                    let window = in_header.window_size;
+                    Some(packet.respond(window, PacketResponse::Reset(seq), &[]))
+                }
+            },
         };
 
         if let Some(mut response_packet) = response {
-            tun.write_packet(&mut response_packet, id.local.ip, id.remote.ip, 0)
+            tun.write_packet(&mut response_packet, id);
         }
 
         None

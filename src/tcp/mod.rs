@@ -16,27 +16,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 trait PacketWrite: Write + Sized {
-    fn write_packet(
-        &mut self,
-        packet: &mut TcpPacket,
-        source: [u8; 4],
-        destination: [u8; 4],
-        eth_header: u16,
-    ) {
+    fn write_packet(&mut self, packet: &mut TcpPacket, id: &ConnectionId) {
         packet.header.checksum = packet
             .header
-            .calc_checksum_ipv4_raw(source, destination, &packet.body)
+            .calc_checksum_ipv4_raw(id.local.ip, id.remote.ip, &packet.body)
             .unwrap();
 
         let ip_response = Ipv4Header::new(
             packet.header.header_len() + packet.body.len() as u16,
             64, // TODO: Find out resonable time to live
             IpNumber::Tcp as u8,
-            source,
-            destination,
+            id.local.ip,
+            id.remote.ip,
         );
 
-        self.write_all(&eth_header.to_be_bytes())
+        self.write_all(&0u16.to_be_bytes())
             .expect("Could not write eth header");
         self.write_all(&IPV4_ETHER_TYPE.to_be_bytes())
             .expect("Could not write eth protocol");
@@ -81,10 +75,6 @@ impl TcpStream {
         result
     }
 
-    fn send_packet(&self, tun: &mut impl PacketWrite, packet: &mut TcpPacket) {
-        tun.write_packet(packet, self.id.local.ip, self.id.remote.ip, 0);
-    }
-
     fn close(&mut self, tun: &mut impl PacketWrite) {
         if let SyncTcpState::Closed | SyncTcpState::FinWait1 | SyncTcpState::LastAck = self.state {
             return;
@@ -94,7 +84,7 @@ impl TcpStream {
                 let mut header = self.blank_header();
                 header.fin = true;
                 let mut packet = TcpPacket::from_header(header);
-                self.send_packet(tun, &mut packet);
+                tun.write_packet(&mut packet, &self.id);
                 self.retransmission = Some(Retransmission {
                     packet,
                     last_sent: std::time::Instant::now(),
@@ -177,7 +167,7 @@ impl TcpStream {
             header: self.blank_header(),
             body: data,
         };
-        self.send_packet(tun, &mut packet);
+        tun.write_packet(&mut packet, &self.id);
         if !packet.body.is_empty() {
             self.retransmission = Some(Retransmission {
                 packet,
@@ -247,14 +237,26 @@ impl TcpStream {
 pub struct TcpStreamHandle {
     id: ConnectionId,
     manager: ConnectionManager,
+    nonblocking: bool,
 }
 
 impl TcpStreamHandle {
+    fn new(id: ConnectionId, manager: ConnectionManager) -> Self {
+        Self {
+            id,
+            manager,
+            nonblocking: false,
+        }
+    }
     pub fn close(&self) {
         let mut manager_lock = self.manager.lock().unwrap();
         let manager = &mut *manager_lock;
         let stream = manager.connections.get_mut(&self.id).unwrap();
         stream.close(&mut manager.tun);
+    }
+
+    pub fn set_nonblocking(&mut self, nonblocking: bool) {
+        self.nonblocking = nonblocking;
     }
 }
 
@@ -274,6 +276,10 @@ impl Read for TcpStreamHandle {
 
             if !stream.state.can_receive() {
                 break;
+            }
+
+            if self.nonblocking {
+                return Err(ErrorKind::WouldBlock.into());
             }
             std::mem::drop(manager);
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -317,19 +323,23 @@ impl Write for TcpStreamHandle {
         stream.send_next_packet(&mut manager.tun);
         std::mem::drop(manager_lock);
 
-        loop {
+        let sent = loop {
             let manager = self.manager.lock().unwrap();
             let stream = manager
                 .connections
                 .get(&self.id)
                 .ok_or::<std::io::Error>(std::io::ErrorKind::ConnectionAborted.into())?;
             if stream.to_send.len() < buf.len() {
-                break;
+                break buf.len() - stream.to_send.len();
+            }
+
+            if self.nonblocking {
+                return Err(ErrorKind::WouldBlock.into());
             }
             std::mem::drop(manager);
             thread::sleep(std::time::Duration::from_millis(100));
-        }
-        Ok(buf.len())
+        };
+        Ok(sent)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -390,6 +400,7 @@ pub struct InnerConnectionManager {
     nonsync: HashMap<Addr, PotentialConnection>,
 }
 
+#[derive(Clone)]
 pub struct ConnectionManager {
     inner: Arc<Mutex<InnerConnectionManager>>,
 }
@@ -568,7 +579,7 @@ impl ConnectionManager {
 
                 let tun = &mut manager.tun;
                 for (id, retransmission, rtt) in expired {
-                    tun.write_packet(&mut retransmission.packet, id.local.ip, id.remote.ip, 0);
+                    tun.write_packet(&mut retransmission.packet, id);
                     retransmission.last_sent = std::time::Instant::now();
                     retransmission.recalculate_srtt(rtt);
                 }
@@ -598,12 +609,51 @@ impl ConnectionManager {
             if let Some(PotentialConnection::Established(id)) = manager.nonsync.get(&address) {
                 let id = id.clone();
                 manager.nonsync.remove(&address);
-                return Ok(TcpStreamHandle {
+                return Ok(TcpStreamHandle::new(id, self.clone()));
+            }
+            std::mem::drop(manager);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    pub fn connect(&mut self, addr: &str) -> Result<TcpStreamHandle> {
+        let address = addr.try_into()?;
+        let from = Addr {
+            ip: [10, 0, 0, 2],
+            port: 1234,
+        };
+        let id = ConnectionId {
+            local: from,
+            remote: address,
+        };
+
+        {
+            let mut manager = self.lock().unwrap();
+            let isn = 0;
+            let mut packet = TcpPacket::from_header(TcpHeader::new(
+                id.local.port,
+                id.remote.port,
+                isn,
+                UnsyncTcpState::RECIEVE_WINDOW_SIZE,
+            ));
+            packet.header.syn = true;
+            manager.tun.write_packet(&mut packet, &id);
+            manager.nonsync.insert(
+                address,
+                PotentialConnection::None(UnsyncTcpState::SynSent(
+                    isn,
                     id,
-                    manager: ConnectionManager {
-                        inner: Arc::clone(&self.inner),
-                    },
-                });
+                    Retransmission::from_packet(packet),
+                )),
+            );
+        }
+
+        loop {
+            let mut manager = self.lock().unwrap();
+            if let Some(PotentialConnection::Established(id)) = manager.nonsync.get(&address) {
+                let id = id.clone();
+                manager.nonsync.remove(&address);
+                return Ok(TcpStreamHandle::new(id, self.clone()));
             }
             std::mem::drop(manager);
             std::thread::sleep(std::time::Duration::from_millis(100));
