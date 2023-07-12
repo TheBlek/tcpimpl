@@ -156,7 +156,6 @@ impl TcpStream {
             let mut res: Vec<_> = data[..amt].into();
             if amt == data.len() {
                 let remaining_amt = min(other.len(), window - amt);
-                println!("I actually extended by {}", remaining_amt);
                 res.extend_from_slice(&other[..remaining_amt]);
             }
             res
@@ -294,7 +293,9 @@ impl Drop for TcpStreamHandle {
         self.close();
         loop {
             let mut manager = self.manager.lock().unwrap();
-            let stream = manager.connections.get_mut(&self.id).unwrap();
+            let Some(stream) = manager.connections.get_mut(&self.id) else {
+                return;
+            };
 
             if let SyncTcpState::Closed | SyncTcpState::FinWait2 = stream.state {
                 break;
@@ -322,6 +323,10 @@ impl Write for TcpStreamHandle {
         stream.to_send.extend(buf.iter());
         stream.send_next_packet(&mut manager.tun);
         std::mem::drop(manager_lock);
+
+        if self.nonblocking {
+            return Ok(buf.len())
+        }
 
         let sent = loop {
             let manager = self.manager.lock().unwrap();
@@ -445,7 +450,6 @@ impl InnerConnectionManager {
             if eth_protocol != IPV4_ETHER_TYPE {
                 continue;
             }
-
             let Ok(ip_packet) = Ipv4Packet::from_bytes(&data[4..amount]) else {
                 continue;
             };
@@ -512,10 +516,14 @@ impl ConnectionManager {
                     let tun = &mut manager.tun;
                     let connections = &mut manager.connections;
                     let nonsync = &mut manager.nonsync;
+
                     use std::collections::hash_map::Entry;
                     match connections.entry(id.clone()) {
                         Entry::Occupied(mut stream) => {
                             stream.get_mut().on_packet(tun, packet);
+                            if stream.get().state == SyncTcpState::Closed {
+                                stream.remove();
+                            }
                         }
                         Entry::Vacant(vacant) => {
                             let potential_stream = nonsync
@@ -592,31 +600,20 @@ impl ConnectionManager {
         Ok(ConnectionManager { inner })
     }
 
-    // TODO: make a trait IntoAddr or smth
-    pub fn accept(&mut self, addr: &str) -> Result<TcpStreamHandle> {
-        // All the proccessing should be done in a separete thread
-        // Here we should indicate that this address is open to connections
-        // And block until it is accepted. (Non-blocking mode blah-blah)
-        let address = addr.try_into()?;
-        {
-            let mut manager = self.lock().unwrap();
-            manager
-                .nonsync
-                .insert(address, PotentialConnection::None(UnsyncTcpState::Listen));
-        }
-        loop {
-            let mut manager = self.lock().unwrap();
-            if let Some(PotentialConnection::Established(id)) = manager.nonsync.get(&address) {
-                let id = id.clone();
-                manager.nonsync.remove(&address);
-                return Ok(TcpStreamHandle::new(id, self.clone()));
-            }
-            std::mem::drop(manager);
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
+    pub fn bind<T: TryInto<Addr>>(
+        &mut self,
+        addr: T,
+    ) -> std::result::Result<TcpListener, <T as TryInto<Addr>>::Error> {
+        Ok(TcpListener {
+            manager: self.clone(),
+            address: addr.try_into()?,
+        })
     }
 
-    pub fn connect(&mut self, addr: &str) -> Result<TcpStreamHandle> {
+    pub fn accept<T: TryInto<Addr>>(
+        &mut self,
+        addr: T,
+    ) -> std::result::Result<TcpStreamHandle, <T as TryInto<Addr>>::Error> {
         let address = addr.try_into()?;
         let from = Addr {
             ip: [10, 0, 0, 2],
@@ -658,5 +655,55 @@ impl ConnectionManager {
             std::mem::drop(manager);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+    }
+}
+
+pub struct TcpListener {
+    manager: ConnectionManager,
+    address: Addr,
+}
+
+impl TcpListener {
+    // TODO: make a trait IntoAddr or smth
+    pub fn accept(&mut self) -> Result<TcpStreamHandle> {
+        // All the proccessing should be done in a separete thread
+        // Here we should indicate that this address is open to connections
+        // And block until it is accepted. (Non-blocking mode blah-blah)
+        {
+            let mut manager = self.manager.lock().unwrap();
+            manager.nonsync.insert(
+                self.address,
+                PotentialConnection::None(UnsyncTcpState::Listen),
+            );
+        }
+        loop {
+            let mut manager = self.manager.lock().unwrap();
+            if let Some(PotentialConnection::Established(id)) = manager.nonsync.get(&self.address) {
+                let id = id.clone();
+                manager.nonsync.insert(
+                    self.address,
+                    PotentialConnection::None(UnsyncTcpState::Listen),
+                );
+                return Ok(TcpStreamHandle::new(id, self.manager.clone()));
+            }
+            std::mem::drop(manager);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    pub fn incoming(&mut self) -> Incoming {
+        Incoming { listener: self }
+    }
+}
+
+pub struct Incoming<'a> {
+    listener: &'a mut TcpListener,
+}
+
+impl<'a> Iterator for Incoming<'a> {
+    type Item = Result<TcpStreamHandle>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        Some(self.listener.accept())
     }
 }

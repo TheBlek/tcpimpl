@@ -10,6 +10,22 @@ impl From<([u8; 4], u16)> for Addr {
     }
 }
 
+impl TryFrom<(&str, u16)> for Addr {
+    type Error = anyhow::Error;
+
+    fn try_from((ip, port): (&str, u16)) -> Result<Self, Self::Error> {
+        let address = ip
+            .split('.')
+            .filter_map(|s| s.parse::<u8>().ok())
+            .collect::<Vec<_>>()[..4]
+            .try_into()?;
+        Ok(Addr {
+            ip: address,
+            port,
+        })
+    }
+}
+
 impl TryFrom<&str> for Addr {
     type Error = anyhow::Error;
 
